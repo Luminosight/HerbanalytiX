@@ -1,0 +1,486 @@
+// ████████████████████████████████████████████████████████████
+// ██                                                      ██
+// ██   HerbanalytiX — Unified Arduino Sketch  (v2)        ██
+// ██   All sensors on a single Arduino UNO                ██
+// ██                                                      ██
+// ██   TDS CALIBRATION CHANGE:                            ██
+// ██     Old:  3.8 * (raw * 500/1023) - 15               ██
+// ██     New:  (14 + map(raw, 0, 1023, 0, 500)) * 5.6    ██
+// ██                                                      ██
+// ████████████████████████████████████████████████████████████
+//
+// ┌──────────────────────────────────────────────────────────┐
+// │                   TABLE OF CONTENTS                      │
+// ├──────────────────────────────────────────────────────────┤
+// │                                                          │
+// │  [1]  Libraries                                          │
+// │  [2]  Pin Definitions & Constants                        │
+// │  [3]  State Machine & Globals                            │
+// │  [4]  Helper: ADC Sampling                               │
+// │  [5]  Calibration: pH & TDS                              │
+// │  [6]  Sensor Read: DHT22                                 │
+// │  [7]  Conductivity: 2-Prong Sensor Report                │
+// │  [8]  Serial Output                                      │
+// │  [9]  Setup                                              │
+// │  [10] Main Loop                                          │
+// │                                                          │
+// └──────────────────────────────────────────────────────────┘
+//
+// ┌──────────────────────────────────────────────────────────┐
+// │                      PIN MAP                             │
+// ├──────────────────────────────────────────────────────────┤
+// │                                                          │
+// │  Power                                                   │
+// │    D2  → Power (constant HIGH — 5 V supply)              │
+// │    D13 → Power (constant HIGH — 5 V to probe pairs)      │
+// │                                                          │
+// │  Sensors                                                 │
+// │    D3  → DHT22 data (temperature / humidity)             │
+// │    D10 → TDS sensor power (HIGH = ON)                    │
+// │    A0  → TDS sensor output                               │
+// │    A1  → pH sensor output (hardwired to 5 V)             │
+// │                                                          │
+// │  Conductivity Probes (2-prong, analog — voltage divider) │
+// │    A3  → Sensor 1 — GROW                                 │
+// │    A4  → Sensor 2 — CHELATE                              │
+// │    A5  → Sensor 3 — BLOOM                                │
+// │    Each probe: Prong A → D13 (5V), Prong B → pin + 10kΩ  │
+// │                series resistor to GND (voltage divider)  │
+// │    analogRead → voltage → resistance → µS conductance     │
+// │    Thresholds managed server-side (Pi) — Arduino only     │
+// │    reports raw voltage and µS.                            │
+// │                                                          │
+// │  Free Pins                                               │
+// │    D0, D1 (Serial RX/TX), D4–D9, D11, D12               │
+// │    A2 (analog)                                           │
+// │                                                          │
+// │  Note: VL53L0X LiDAR is connected to the Raspberry Pi    │
+// │        via I2C (GPIO 2 SDA, GPIO 3 SCL), NOT the Arduino.│
+// │        A3/A4/A5 are analog inputs — voltage-divider       │
+// │        conductivity probes with 10kΩ series resistors.    │
+// │                                                          │
+// └──────────────────────────────────────────────────────────┘
+//
+//  pH is powered directly from Arduino 5 V pin — never toggled.
+//  Only TDS is power-switched, eliminating pH probe cycling damage.
+//
+//  10-second sensor cycle (millis-based, no RTC needed):
+//    0–1 s   : pH reading window  (TDS OFF, no interference)
+//    2–6 s   : Isolation          (TDS OFF, pH settles)
+//              DHT22 read once during this window
+//    6–9 s   : TDS ON + read at 8 s
+//    9–10 s  : TDS OFF, results pushed over serial
+//
+//  Conductivity probes are polled continuously every loop
+//  iteration, independent of the 10-second sensor cycle.
+//
+//  Output format (sensor cycle):
+//    [MM:SS] pH: X.XX | TDS: XXX.X ppm | Temp: XX.X C | Hum: XX.X %
+//  Output format (conductivity — periodic every 500 ms):
+//    A3 GROW     | ADC: XXX | Voltage: X.XX V | Conductivity: XXX.X uS
+//    A4 CHELATE  | ADC: XXX | Voltage: X.XX V | Conductivity: XXX.X uS
+//    A5 BLOOM    | ADC: XXX | Voltage: X.XX V | Conductivity: XXX.X uS
+//  Threshold comparison done server-side (Pi) — Arduino is dumb reporter.
+//
+//  Required Libraries (install via Arduino Library Manager):
+//    - DHT sensor library  (by Adafruit)
+//  No other external libraries needed.
+// ============================================================
+
+
+// ──────────────── [1] Libraries ─────────────────────────────
+
+#include <DHT.h>
+
+
+// ──────────────── [2] Pin Definitions & Constants ───────────
+
+// ── Power pins ──────────────────────────────────────────────
+#define POWER_PIN        2    // constant HIGH — 5 V supply
+#define PROBE_PWR_PIN   13    // constant HIGH — 5 V to all conductivity probes
+
+// ── DHT22 ───────────────────────────────────────────────────
+#define DHTPIN           3
+#define DHTTYPE          DHT22
+
+// ── Conductivity probes (2-prong, analog — voltage divider) ─
+//  A3/A4/A5 used as analog inputs via analogRead().
+//  10 kΩ series resistor per probe forms voltage divider.
+//  Formula: R_sensor = 10000 * (5V - V) / V  →  µS = 1e6 / R
+//  Arduino reports raw voltage + µS only; threshold comparison
+//  is done server-side on the Pi for easy switching.
+#define SENSOR1         A3    // analog sense — GROW    (A3)
+#define SENSOR2         A4    // analog sense — CHELATE (A4)
+#define SENSOR3         A5    // analog sense — BLOOM   (A5)
+#define NUM_SENSORS      3
+#define SERIES_RESISTOR 10000.0  // 10 kΩ series resistor
+#define VREF            5.0      // Arduino UNO reference voltage
+#define ADC_RESOLUTION  1023.0
+
+// ── TDS power-switched ──────────────────────────────────────
+#define TDS_PWR_PIN     10
+#define TDS_PIN         A0
+
+// ── pH (always on) ──────────────────────────────────────────
+#define PH_PIN          A1
+
+// ── TDS calibration constants ───────────────────────────────
+//  Formula: tds_ppm = (TDS_OFFSET + map(raw, 0, 1023, 0, 500)) * TDS_MULTIPLIER
+//  Adjust TDS_MULTIPLIER and TDS_OFFSET to match your reference meter.
+#define TDS_MULTIPLIER  5.6f
+#define TDS_OFFSET      14.0f
+
+// ── Timing (ms) ─────────────────────────────────────────────
+#define CYCLE_MS        10000UL
+#define PH_READ_TIME     1000UL   // read pH at 1 s
+#define TDS_ON_TIME      6000UL   // power TDS on at 6 s
+#define TDS_READ_TIME    8000UL   // read TDS at 8 s (2 s warm-up)
+#define TDS_OFF_TIME     9000UL   // power TDS off at 9 s
+
+#define SAMPLE_COUNT        10
+#define SAMPLE_INTERVAL_MS  50UL
+
+#define COND_PRINT_INTERVAL 500UL   // conductivity status print every 500 ms
+
+
+// ──────────────── [3] State Machine & Globals ───────────────
+
+// ── Sensor-cycle state machine ──────────────────────────────
+enum State {
+  ST_PH_WAIT,    // waiting for pH read time
+  ST_PH_READ,    // sampling pH
+  ST_ISO,        // isolation — TDS still off, env sensors read here
+  ST_TDS_ON,     // TDS powered, warming up
+  ST_TDS_READ,   // sampling TDS
+  ST_TDS_OFF,    // TDS powered down, waiting for cycle end
+  ST_PUSH        // push result over serial, reset cycle
+};
+
+DHT dht(DHTPIN, DHTTYPE);
+
+unsigned long cycleStart   = 0;
+State         state        = ST_PH_WAIT;
+
+float lastPH   = -999.0;
+float lastTDS  = -999.0;
+float lastTemp = -999.0;
+float lastHum  = -999.0;
+
+bool phReadDone  = false;
+bool envReadDone = false;
+bool tdsReadDone = false;
+
+unsigned long totalSeconds = 0;
+
+// ── Conductivity globals ────────────────────────────────────
+unsigned long lastCondPrint = 0;
+
+
+// ──────────────── [4] Helper: ADC Sampling ──────────────────
+//  Takes SAMPLE_COUNT readings, drops min/max, averages the rest.
+
+float sampledRead(uint8_t pin) {
+  int readings[SAMPLE_COUNT];
+  for (int i = 0; i < SAMPLE_COUNT; i++) {
+    readings[i] = analogRead(pin);
+    delay(SAMPLE_INTERVAL_MS);
+  }
+  int  minVal = readings[0], maxVal = readings[0];
+  long sum    = 0;
+  for (int i = 0; i < SAMPLE_COUNT; i++) {
+    if (readings[i] < minVal) minVal = readings[i];
+    if (readings[i] > maxVal) maxVal = readings[i];
+    sum += readings[i];
+  }
+  sum -= minVal;
+  sum -= maxVal;
+  float avg     = (float)sum / (SAMPLE_COUNT - 2);
+  float voltage = avg * (5.0f / 1023.0f);
+
+  Serial.print(F("  [DBG] pin=A"));
+  Serial.print(pin == A0 ? 0 : 1);
+  Serial.print(F(" raw="));
+  Serial.print(avg, 1);
+  Serial.print(F(" voltage="));
+  Serial.print(voltage, 4);
+  Serial.println(F("V"));
+
+  return avg;
+}
+
+
+// ──────────────── [5] Calibration: pH & TDS ─────────────────
+
+float computePH(float raw) {
+  float voltage      = raw * (5.0f / 1023.0f);
+  float ph_measured  = -1.9f  * voltage      + 13.2f;
+  float ph_corrected =  3.02f * ph_measured  - 13.8f;
+  float ph_final     =  1.018f* ph_corrected - 0.19f;
+  return ph_final;
+}
+
+// ── NEW TDS formula ─────────────────────────────────────────
+//  tds_ppm = (TDS_OFFSET + map(raw, 0, 1023, 0, 500)) * TDS_MULTIPLIER
+//
+//  map() returns a long, so we cast to float for the multiply.
+//  TDS_MULTIPLIER (5.6) and TDS_OFFSET (14) are tuneable via
+//  the #defines at the top of this file.
+//
+//  To recalibrate:
+//    1. Dip probe in reference solution (e.g. 342 ppm).
+//    2. Read Serial output — note the raw and mapped values.
+//    3. Adjust TDS_MULTIPLIER until the printed ppm matches.
+//    4. TDS_OFFSET shifts the entire curve up/down.
+// ─────────────────────────────────────────────────────────────
+float computeTDS(float raw) {
+  long mapped   = map((long)raw, 0, 1023, 0, 500);
+  float tds_ppm = (TDS_OFFSET + (float)mapped) * TDS_MULTIPLIER;
+  if (tds_ppm < 0.0f) tds_ppm = 0.0f;
+  return tds_ppm;
+}
+
+
+// ──────────────── [6] Sensor Read: DHT22 ────────────────────
+
+void readDHT(float &tempOut, float &humOut) {
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (isnan(t) || isnan(h)) {
+    tempOut = 0;
+    humOut  = 0;
+    Serial.println(F("  [DBG] DHT read failed"));
+    return;
+  }
+  tempOut = t;
+  humOut  = h;
+
+  Serial.print(F("  [DBG] temp="));
+  Serial.print(t, 1);
+  Serial.print(F("C hum="));
+  Serial.print(h, 1);
+  Serial.println(F("%"));
+}
+
+
+// ──────────────── [7] Conductivity: 2-Prong Sensor Report ───
+//  All three sensors use analogRead on A3/A4/A5.
+//  Voltage divider: Prong A → 5 V (D13), Prong B → pin.
+//  10 kΩ series resistor between pin and GND.
+//  When water bridges the prongs, current flows and voltage rises.
+//  Formula: R_sensor = SERIES_RESISTOR * (VREF - V) / V
+//           µS = 1,000,000 / R_sensor
+//  Arduino only reports raw values; threshold logic is on the Pi.
+
+void readSensor(int pin, String name) {
+  int adcValue = analogRead(pin);
+  float voltage = adcValue * (VREF / ADC_RESOLUTION);
+
+  float sensorResistance = 0;
+  float microSiemens = 0;
+
+  if (voltage > 0.01) {
+    sensorResistance = (SERIES_RESISTOR * (VREF - voltage)) / voltage;
+    float conductance = 1.0 / sensorResistance;
+    microSiemens = conductance * 1000000.0;
+  }
+
+  Serial.print(name);
+  Serial.print(" | ADC: ");
+  Serial.print(adcValue);
+  Serial.print(" | Voltage: ");
+  Serial.print(voltage, 2);
+  Serial.print(" V | Conductivity: ");
+  Serial.print(microSiemens, 1);
+  Serial.println(" uS");
+}
+
+void checkConductivity() {
+  unsigned long now = millis();
+  if (now - lastCondPrint >= COND_PRINT_INTERVAL) {
+    lastCondPrint = now;
+    readSensor(SENSOR1, "A3 GROW    ");
+    readSensor(SENSOR2, "A4 CHELATE ");
+    readSensor(SENSOR3, "A5 BLOOM   ");
+    Serial.println(F("----------------------"));
+  }
+}
+
+
+// ──────────────── [8] Serial Output ─────────────────────────
+
+void pushResult() {
+  unsigned long mm = totalSeconds / 60;
+  unsigned long ss = totalSeconds % 60;
+
+  char ts[10];
+  sprintf(ts, "[%02lu:%02lu]", mm, ss);
+  Serial.print(ts);
+
+  // pH
+  Serial.print(F(" pH: "));
+  if (lastPH >= 0.0f && lastPH <= 14.0f) {
+    Serial.print(lastPH, 2);
+  } else {
+    Serial.print(F("---"));
+  }
+
+  // TDS
+  Serial.print(F(" | TDS: "));
+  if (lastTDS >= 0.0f && lastTDS <= 5000.0f) {
+    Serial.print(lastTDS, 1);
+    Serial.print(F(" ppm"));
+  } else {
+    Serial.print(F("--- ppm"));
+  }
+
+  // Temperature
+  Serial.print(F(" | Temp: "));
+  if (lastTemp > 0.0f) {
+    Serial.print(lastTemp, 1);
+    Serial.print(F(" C"));
+  } else {
+    Serial.print(F("--- C"));
+  }
+
+  // Humidity
+  Serial.print(F(" | Hum: "));
+  if (lastHum > 0.0f) {
+    Serial.print(lastHum, 1);
+    Serial.println(F(" %"));
+  } else {
+    Serial.println(F("--- %"));
+  }
+}
+
+
+// ──────────────── [9] Setup ─────────────────────────────────
+
+void setup() {
+  Serial.begin(9600);
+
+  // ── Power pins ────────────────────────────────────────────
+  pinMode(POWER_PIN, OUTPUT);
+  digitalWrite(POWER_PIN, HIGH);          // D2 → 5 V supply
+
+  pinMode(PROBE_PWR_PIN, OUTPUT);
+  digitalWrite(PROBE_PWR_PIN, HIGH);      // D13 → 5 V to conductivity probes
+
+  // ── TDS power control — off at boot ───────────────────────
+  pinMode(TDS_PWR_PIN, OUTPUT);
+  digitalWrite(TDS_PWR_PIN, LOW);
+
+  // ── DHT22 ─────────────────────────────────────────────────
+  dht.begin();
+
+  // ── Conductivity probes (A3, A4, A5) — analog inputs ─────
+  //  10 kΩ series resistor per probe (voltage divider to GND).
+  //  VL53L0X LiDAR is now on the Pi (I2C GPIO 2/3).
+  //  No explicit pinMode needed for analogRead on UNO,
+  //  but set INPUT to document intended usage.
+  pinMode(SENSOR1, INPUT);     // A3 — GROW
+  pinMode(SENSOR2, INPUT);     // A4 — CHELATE
+  pinMode(SENSOR3, INPUT);     // A5 — BLOOM
+
+  // ── Init timing ───────────────────────────────────────────
+  cycleStart    = millis();
+  totalSeconds  = 0;
+  lastCondPrint = millis();
+
+  // ── Boot banner ───────────────────────────────────────────
+  Serial.println(F("=== HerbanalytiX Unified Sensor Array (v2 — new TDS cal) ==="));
+  Serial.println(F("pH: always on (5V hardwired) | TDS: power-switched D10"));
+  Serial.println(F("DHT22: D3 | LiDAR: on Pi (I2C GPIO 2/3) | Power: D2"));
+  Serial.println(F("Conductivity: D13→5V | A3→GROW | A4→CHELATE | A5→BLOOM (2-prong)"));
+  Serial.print(F("TDS formula: ("));
+  Serial.print(TDS_OFFSET, 0);
+  Serial.print(F(" + mapped) * "));
+  Serial.println(TDS_MULTIPLIER, 1);
+  Serial.println(F("Sensor data every 10 s | Conductivity polled every 500 ms"));
+  Serial.println(F("Thresholds managed server-side (Pi)"));
+  Serial.println();
+}
+
+
+// ──────────────── [10] Main Loop ────────────────────────────
+
+void loop() {
+  unsigned long now     = millis();
+  unsigned long elapsed = now - cycleStart;
+
+  // ── Conductivity check (runs every iteration) ─────────────
+  checkConductivity();
+
+  // ── 10-second sensor cycle state machine ──────────────────
+  switch (state) {
+
+    case ST_PH_WAIT:
+      if (elapsed >= PH_READ_TIME) {
+        state = ST_PH_READ;
+      }
+      break;
+
+    case ST_PH_READ:
+      if (!phReadDone) {
+        Serial.println(F("  [STATE] Reading pH..."));
+        float raw = sampledRead(PH_PIN);
+        lastPH    = computePH(raw);
+        phReadDone = true;
+        Serial.print(F("  [STATE] pH = "));
+        Serial.println(lastPH, 4);
+      }
+      state = ST_ISO;
+      break;
+
+    case ST_ISO:
+      if (!envReadDone) {
+        Serial.println(F("  [STATE] Reading DHT22..."));
+        readDHT(lastTemp, lastHum);
+        envReadDone = true;
+      }
+      if (elapsed >= TDS_ON_TIME) {
+        state = ST_TDS_ON;
+      }
+      break;
+
+    case ST_TDS_ON:
+      digitalWrite(TDS_PWR_PIN, HIGH);
+      Serial.println(F("  [STATE] TDS sensor ON — warming up..."));
+      state = ST_TDS_READ;
+      break;
+
+    case ST_TDS_READ:
+      if (elapsed >= TDS_READ_TIME && !tdsReadDone) {
+        Serial.println(F("  [STATE] Reading TDS..."));
+        float raw  = sampledRead(TDS_PIN);
+        lastTDS    = computeTDS(raw);
+        tdsReadDone = true;
+        Serial.print(F("  [STATE] TDS = "));
+        Serial.print(lastTDS, 2);
+        Serial.println(F(" ppm"));
+        state = ST_TDS_OFF;
+      }
+      break;
+
+    case ST_TDS_OFF:
+      if (elapsed >= TDS_OFF_TIME) {
+        digitalWrite(TDS_PWR_PIN, LOW);
+        Serial.println(F("  [STATE] TDS sensor OFF"));
+        state = ST_PUSH;
+      }
+      break;
+
+    case ST_PUSH:
+      if (elapsed >= CYCLE_MS) {
+        totalSeconds += 10;
+        cycleStart   += CYCLE_MS;
+        phReadDone    = false;
+        envReadDone   = false;
+        tdsReadDone   = false;
+
+        pushResult();
+
+        state = ST_PH_WAIT;
+      }
+      break;
+  }
+}

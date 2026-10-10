@@ -1,50 +1,22 @@
-# Welcome to your Expo app 👋
+# HerbanalytiX 🌿📷
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+**HerbanalytiX** is an automated aeroponics monitoring and control system powered by computer vision. It leverages real-time visual analysis to dynamically regulate nutrient pump dosing cycles and optimize grow-light scheduling for improved plant growth and resource efficiency.
 
-## Get started
+---
 
-1. Install dependencies
+## 🔑 Key Features
 
-   ```bash
-   npm install
-   ```
+* **Visual Growth & Health Monitoring:** Real-time camera feed analysis using computer vision to track plant health and growth stages.
+* **Automated Pump Management:** Smart timing and adaptive duty cycles for high-pressure nutrient misting based on visual plant metrics.
+* **Dynamic Lighting Schedules:** Visual detection-assisted light control to adjust photoperiod duration and intensity.
+* **Dataset Management:** Integrated dataset annotation and preprocessing pipeline (CVAT / Roboflow).
 
-2. Start the app
+---
 
-   ```bash
-   npx expo start
-   ```
+## 🏗️ System Architecture
 
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
-
-```bash
-npm run reset-project
-```
-
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
-
-## Learn more
-
-To learn more about developing your project with Expo, look at the following resources:
-
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
-
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+```text
+  [ Camera / CV Sensor ] ───► [ Computer Vision Pipeline ]
+                                       │
+                                       ▼
+ [ Actuators: Pumps & Lights ] ◄─── [ Control Logic / Decision Engine ]
